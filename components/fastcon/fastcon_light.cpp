@@ -1,8 +1,8 @@
-
 #include "esphome/core/log.h"
 #include "esphome/components/light/light_state.h"
 #include "fastcon_controller.h"
 #include "fastcon_light.h"
+#include <cmath>
 
 #ifndef FASTCON_VERSION
 #define FASTCON_VERSION "0.3.3-dev"
@@ -15,6 +15,8 @@ static const char *const TAG = "fastcon.light";
 
 light::LightTraits FastconLight::get_traits() {
   light::LightTraits t;
+  
+  // Define supported color modes based on hardware capabilities
   if (this->color_interlock_) {
     if (this->supports_cwww_) {
       t.set_supported_color_modes({light::ColorMode::RGB, light::ColorMode::COLD_WARM_WHITE});
@@ -30,8 +32,8 @@ light::LightTraits FastconLight::get_traits() {
   }
 
   if (this->supports_cwww_) {
-    t.set_min_mireds(153.0f);
-    t.set_max_mireds(500.0f);
+    t.set_min_mireds(153.0f); // 6500K
+    t.set_max_mireds(500.0f); // 2000K
   }
   
   return t;
@@ -39,32 +41,40 @@ light::LightTraits FastconLight::get_traits() {
 
 void FastconLight::write_state(light::LightState *state) {
   if (this->controller_ == nullptr) {
-    ESP_LOGW(TAG, "No controller bound; dropping command");
+    ESP_LOGW(TAG, "No controller bound; dropping command for light %u", (unsigned)this->light_id_);
     return;
   }
 
   std::vector<uint8_t> light_bytes;
   auto &values = state->current_values;
 
-  // Determine if it's a "white-only" command
-  bool is_white_only = values.get_color_mode() == light::ColorMode::WHITE;
+  // 1. Determine if this is a white-only or color command
+  // We treat pure white or equal RGB values as a "white" command to trigger the dedicated white LEDs
+  float r = values.get_red();
+  float g = values.get_green();
+  float b = values.get_blue();
+  
+  bool is_white_only = false;
+  if (values.get_color_mode() == light::ColorMode::WHITE ||
+      (fabs(r - g) < 0.001f && fabs(g - b) < 0.001f)) {
+    is_white_only = true;
+  }
 
+  // 2. Fetch the appropriate raw data payload from the controller
   if (is_white_only) {
-    ESP_LOGD(TAG, "Sending white-only command for light %u", (unsigned)this->light_id_);
+    ESP_LOGV(TAG, "Processing white-only state for light %u", (unsigned)this->light_id_);
     light_bytes = this->controller_->get_white_light_data(state);
   } else {
-    ESP_LOGD(TAG, "Sending RGB/color command for light %u", (unsigned)this->light_id_);
+    ESP_LOGV(TAG, "Processing RGB state for light %u", (unsigned)this->light_id_);
     light_bytes = this->controller_->get_light_data(state);
   }
 
-  // Wrap into inner payload for this light_id
-  std::vector<uint8_t> payload = this->controller_->single_control(this->light_id_, light_bytes);
+  // 3. Hand off the data to the controller's high-speed burst queue
+  // This method wraps the bytes, encrypts them, and adds them to the 20x retransmit loop
+  this->controller_->single_control(this->light_id_, light_bytes);
 
-  // Queue it for advertisement
-  this->controller_->queueCommand(this->light_id_, payload);
-
-  ESP_LOGD(TAG, "Queued state v%s: light_id=%u, payload_len=%d",
-           FASTCON_VERSION, (unsigned)this->light_id_, (int)payload.size());
+  ESP_LOGD(TAG, "Queued burst command: light_id=%u, mode=%s", 
+           (unsigned)this->light_id_, is_white_only ? "WHITE" : "RGB");
 }
 
 }  // namespace fastcon
